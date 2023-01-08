@@ -18,6 +18,8 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "corrPI.h"
+#include "commandeMCC.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -44,7 +46,7 @@
 // DEL = delete
 #define ASCII_DEL 0x7F
 #define ARR_VAL 1024
-#define ALPHA 600
+#define ALPHA 600 /** Rapport cyclique permettant de gérer les PWM entre 0 et 1023 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -79,12 +81,35 @@ uint8_t uartRxBuffer[UART_RX_BUFFER_SIZE];
 uint8_t uartTxBuffer[UART_TX_BUFFER_SIZE];
 uint8_t powerOn[]="Allumage du moteur\r\n";
 uint8_t powerOff[]="Extinction du moteur\r\n";
-int a; //alpha dans la fonction alpha
+int a; //alpha dans la fonction alpha*
+int adcValue; /** Valeure de courant relevée après convertion en ampères*/
 long vitesse;
-int speedFlag;
+int PIFlag;
+int PIUpdateFlag;
 float i_n[2]; //{i_0, i_-1}
 float w_n[2]; //{w_0, w_-1}
+float i_consigne;
+float v_consigne;
+#define KP_ALPHA 0.10	//0.0039
+#define KI_ALPHA 0.8	//1.74
 
+
+#define ALPHA_OUT_MAX_VALUE 0.99
+#define ALPHA_OUT_MIN_VALUE 0.01
+
+#define TIM1_PERIOD 0.0000625
+
+// PI Vitesse
+#define KP_CURRENT 0.1		//empirique0.1	//matlab0.72
+#define KI_CURRENT 2.0	//empirique0.1	//matlab15.94
+
+#define CURRENT_OUT_MAX_VALUE	2.0
+
+#define TIM3_PERIOD 0.1
+#define TIM4_PERIOD 0.0064
+
+#define TICK2SPEED_TIM3 0.0146 // 60/4096/TimerDelay    avec TimerDelay(en sec)
+#define TICK2SPEED_TIM4 (60.0/4096.0)/TIM4_PERIOD
 
 uint16_t AD_RES = 0;
 /*
@@ -134,6 +159,7 @@ void newcom(void)
 }
 
 // Suppression du dernier caractère
+/** Supprime le dernier caractère après avoir appuyé sur BackSpace */
 void delete(void)
 		{
 	cmdBuffer[idx_cmd--] = '\0';
@@ -141,7 +167,7 @@ void delete(void)
 		}
 
 // Nouveau caractère
-
+/** Ecrit le caractère tapé dans la console */
 void new_carac(void)
 {
 	cmdBuffer[idx_cmd++] = uartRxBuffer[0];
@@ -165,7 +191,10 @@ void set(void)
 		HAL_UART_Transmit(&huart2, cmdNotFound, sizeof(cmdNotFound), HAL_MAX_DELAY);
 	}
 }
-
+/**
+ * @brief Présente les fonctions et leur utilités dans la console
+ *
+ */
 void help(void)
 {
 	sprintf(uartTxBuffer, "HELP : Fonctions available :\r\n");
@@ -179,13 +208,18 @@ void help(void)
 	sprintf(uartTxBuffer, "- alpha : fixe la valeur du rapport cyclique\r\n");
 	HAL_UART_Transmit(&huart2, uartTxBuffer, sizeof(uartTxBuffer), HAL_MAX_DELAY);
 }
-
+/**
+ * @brief Initialise le hacheur et lance les PWM avec alpha = 50%
+ *
+ */
 void start(void)
 {
 	//séquence d'initialisation
 	HAL_GPIO_WritePin(ISO_RESET_GPIO_Port, ISO_RESET_Pin, SET);
+	HAL_Delay(10);
+	HAL_GPIO_WritePin(ISO_RESET_GPIO_Port, ISO_RESET_Pin, RESET);
 	//HAL_Delay(5);
-	a = 600;
+
 	HAL_UART_Transmit(&huart2, powerOn, sizeof(powerOn), HAL_MAX_DELAY);
 	HAL_TIM_Base_Start(&htim1);
 	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
@@ -197,10 +231,15 @@ void start(void)
 	TIM1->CCR1=ARR_VAL-a;
 	TIM1->CCR2=a;
 }
-
+/**
+ * @brief Arrête les moteurs
+ *
+ */
 void stop(void)
 {
 	HAL_UART_Transmit(&huart2, powerOff, sizeof(powerOff), HAL_MAX_DELAY);
+	TIM1->CCR1 = ARR_VAL/2;
+	TIM1->CCR2 = 1 - ARR_VAL/2;
 	HAL_TIM_Base_Stop(&htim1);
 	HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
 	HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
@@ -209,7 +248,10 @@ void stop(void)
 	HAL_Delay(5);
 	HAL_GPIO_WritePin(ISO_RESET_GPIO_Port, ISO_RESET_Pin, RESET);
 }
-
+/**
+ * @brief Règle le rapport cyclique des PWM, avec une valeur entre 0 et 100%
+ *
+ */
 void speed(void)
 {
 	a = atoi(argv[1]);
@@ -218,7 +260,18 @@ void speed(void)
 	TIM1->CCR2=a;
 }
 
+void changeSpeed(int a)
+{
+	a = ARR_VAL*a/100;
+	TIM1->CCR1=ARR_VAL-a;
+	TIM1->CCR2=a;
+}
 
+/**
+ * @brief Permet de réinitialiser le flag adcDmaFlag après l'éxecution automatique de l'interruption dans le shell
+ *
+ * @param hadc
+ */
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
 	adcDmaFlag = 1;
@@ -228,14 +281,46 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 /* USER CODE END 0 */
 
 /**
-  * @brief  The application entry point.
-  * @retval int
+  * @brief  Lance le Shell et initialise les périphériques
+  *
   */
 int main(void)
 {
   /* USER CODE BEGIN 1 */
 
 
+	/* Correcteur pour vitesse */
+	PIController alphaPI;
+	PIController_Init(&alphaPI);
+
+	  alphaPI.Kp = KP_ALPHA;
+	  alphaPI.Ki = KI_ALPHA;
+
+	  alphaPI.T = TIM3_PERIOD;
+
+	  alphaPI.integrator = 0.5;
+
+	  alphaPI.limMax_integrator = ALPHA_OUT_MAX_VALUE;
+	  alphaPI.limMin_integrator = ALPHA_OUT_MIN_VALUE;
+
+	  alphaPI.limMax_output = ALPHA_OUT_MAX_VALUE;
+	  alphaPI.limMin_output = ALPHA_OUT_MIN_VALUE;
+
+
+	  /* Correcteur pour courant */
+	  PIController currentPI;
+	  PIController_Init(&currentPI);
+
+	   currentPI.Kp = KP_CURRENT;
+	   currentPI.Ki = KI_CURRENT;
+
+	   currentPI.T = TIM3_PERIOD;
+
+	   currentPI.limMax_integrator = CURRENT_OUT_MAX_VALUE;
+	   currentPI.limMin_integrator = -CURRENT_OUT_MAX_VALUE;
+
+	   currentPI.limMax_output = CURRENT_OUT_MAX_VALUE;
+	   currentPI.limMin_output = -CURRENT_OUT_MAX_VALUE;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -335,21 +420,27 @@ int main(void)
 			memset(cmdBuffer,NULL,CMD_BUFFER_SIZE*sizeof(char));
 		}
 
-		if(adcDmaFlag){
-			//sprintf(uartTxBuffer,"{ADC1 Value: %1.2f}\r\n", 12*(2.54-((float)(adcRawValue[0]*3.3/4096))));//
-			//HAL_UART_Transmit(&huart2, uartTxBuffer, sizeof(uartTxBuffer), HAL_MAX_DELAY);
-			adcDmaFlag = 0;
-		}
 
-		if(speedFlag){
+		if(PIUpdateFlag){/* Permet d'afficher la vitesse et le courant lorsque l'adc/dma ont finit leur mesure */
 			vitesse = (TIM2->CNT)-(TIM2->ARR/2);
 			TIM2->CNT = TIM2->ARR/2;
-			sprintf(uartTxBuffer,"{vitesse: %1.2f}{ADC_Value: %1.2f}\r\n", ((float)vitesse)/10.55, 12*(2.51-((((float)adcRawValue[0])*3.3/4096))));
-			HAL_UART_Transmit(&huart2, uartTxBuffer, sizeof(uartTxBuffer), HAL_MAX_DELAY);
-			HAL_Delay(10);
-			speedFlag = 0;
-		}
+			adcValue = 12*(2.51-((((float)adcRawValue[0])*3.3/4096))); /* Calcul pour convertir la valeur binaire de l'adc en amperes */
+			vitesse = (float)vitesse/10.55; /* Calcul pour convertir la valeur en ticks de la vitesse en tours/minutes */
 
+			if(PIFlag){
+				PIController_Update(&alphaPI, i_consigne, adcValue);
+				changeSpeed((int)(alphaPI.out*100));
+				PIFlag = 0;
+			}
+			else{
+				if(!PIFlag){
+					PIController_Update(&currentPI, v_consigne, vitesse);
+					i_consigne = currentPI.out;
+					PIFlag = 1;
+				}
+			}
+			PIUpdateFlag = 0;
+		}
 
 
 
